@@ -11560,6 +11560,197 @@ static LogicalResult unqueezeTensorDims(Operation *op,
   return success();
 }
 
+static FailureOr<Value>
+bilinearInterpolateForRoiAlign(PatternRewriter &rewriter, Operation *op,
+                               Value input, Value roiBatchIndex, Value y,
+                               Value x, Value yMask, Value xMask) {
+  auto loc = input.getLoc();
+  auto inputVType = cast<ValueTensorType>(input.getType());
+  Value cstZero =
+      rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(0));
+  Value cstOne =
+      rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(1));
+  Value cstMinusOne =
+      rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(-1));
+  Value cstOneF =
+      rewriter.create<ConstantFloatOp>(loc, rewriter.getF64FloatAttr(1.0));
+  Value cstNone = rewriter.create<ConstantNoneOp>(loc);
+
+  auto channels = getTensorDimSize(rewriter, input, 1);
+  auto height = getTensorDimSize(rewriter, input, 2);
+  auto width = getTensorDimSize(rewriter, input, 3);
+
+  Value heightMinusOne = rewriter.create<AtenSubIntOp>(loc, height, cstOne);
+  Value widthMinusOne = rewriter.create<AtenSubIntOp>(loc, width, cstOne);
+
+  y = rewriter.create<AtenClampMinOp>(loc, y.getType(), y, cstZero);
+  x = rewriter.create<AtenClampMinOp>(loc, x.getType(), x, cstZero);
+
+  Value yLow =
+      convertTensorToDtype(rewriter, loc, y, rewriter.getIntegerType(32, true));
+  Value xLow =
+      convertTensorToDtype(rewriter, loc, x, rewriter.getIntegerType(32, true));
+  Value yLowPlusOne = rewriter.create<AtenAddScalarOp>(loc, yLow.getType(),
+                                                       yLow, cstOne, cstOne);
+  Value xLowPlusOne = rewriter.create<AtenAddScalarOp>(loc, xLow.getType(),
+                                                       xLow, cstOne, cstOne);
+
+  auto yLowType = cast<ValueTensorType>(yLow.getType());
+  auto cmpResultType = yLowType.getWithSizesAndDtype(
+      yLowType.getOptionalSizes(), rewriter.getI1Type());
+  Value yLowGtHeight =
+      rewriter.create<AtenGeScalarOp>(loc, cmpResultType, yLow, heightMinusOne);
+  Value yHigh = rewriter.create<AtenWhereScalarSelfOp>(
+      loc, yLowType, yLowGtHeight, heightMinusOne, yLowPlusOne);
+  yLow = rewriter.create<AtenWhereScalarSelfOp>(loc, yLowType, yLowGtHeight,
+                                                heightMinusOne, yLow);
+
+  // TODO::   y = torch.where(y_low >= height - 1, y.to(input.dtype), y)
+
+  auto xLowType = cast<ValueTensorType>(xLow.getType());
+  cmpResultType = xLowType.getWithSizesAndDtype(xLowType.getOptionalSizes(),
+                                                rewriter.getI1Type());
+  Value xLowGtWidth =
+      rewriter.create<AtenGeScalarOp>(loc, cmpResultType, xLow, widthMinusOne);
+  Value xHigh = rewriter.create<AtenWhereScalarSelfOp>(
+      loc, xLowType, xLowGtWidth, widthMinusOne, xLowPlusOne);
+  xLow = rewriter.create<AtenWhereScalarSelfOp>(loc, xLowType, xLowGtWidth,
+                                                widthMinusOne, xLow);
+  // TODO::     x = torch.where(x_low >= width - 1, x.to(input.dtype), x)
+  Value ly =
+      rewriter.create<AtenSubTensorOp>(loc, y.getType(), y, yLow, cstOne);
+  Value lx =
+      rewriter.create<AtenSubTensorOp>(loc, x.getType(), x, xLow, cstOne);
+  Value hy =
+      rewriter.create<AtenRsubScalarOp>(loc, ly.getType(), ly, cstOneF, cstOne);
+  Value hx =
+      rewriter.create<AtenRsubScalarOp>(loc, lx.getType(), lx, cstOneF, cstOne);
+
+  auto getTorchConstantInts = [&](ArrayRef<int64_t> constants,
+                                  SmallVectorImpl<Value> &constantValues) {
+    for (int64_t c : constants) {
+      constantValues.push_back(rewriter.create<Torch::ConstantIntOp>(
+          loc, rewriter.getI64IntegerAttr(c)));
+    }
+  };
+
+  auto getMaskedIndex = [&](Value y, Value x) -> FailureOr<Value> {
+    // TODO:: Check ymask
+    Value unsqueezedRoiBatchIndex;
+    if (failed(unqueezeTensorDims(
+            op, rewriter, roiBatchIndex, unsqueezedRoiBatchIndex,
+            {cstMinusOne, cstMinusOne, cstMinusOne, cstMinusOne, cstMinusOne})))
+      return failure();
+
+    auto channelRangeType = getTensorTypeFromShapeValues(
+        {channels}, rewriter.getIntegerType(64, true));
+    Value channelRange = rewriter.create<AtenArangeOp>(
+        loc, channelRangeType, channels,
+        /*dtype=*/cstNone, /*layout=*/cstNone,
+        /*device=*/cstNone, /*pin_memory=*/cstNone);
+    if (failed(unqueezeTensorDims(
+            op, rewriter, channelRange, channelRange,
+            {cstZero, cstMinusOne, cstMinusOne, cstMinusOne, cstMinusOne})))
+      return failure();
+
+    SmallVector<Value> yDims, xDims;
+    getTorchConstantInts({1, 3, 5}, yDims);
+    getTorchConstantInts({1, 2, 4}, xDims);
+
+    if (failed(unqueezeTensorDims(op, rewriter, y, y, yDims)))
+      return failure();
+
+    if (failed(unqueezeTensorDims(op, rewriter, x, x, xDims)))
+      return failure();
+
+    auto listElemType =
+        xLowType.getWithSizesAndDtype(/*optionalSizes=*/std::nullopt,
+                                      /*optionalDtype=*/nullptr);
+    auto indexList = rewriter.create<PrimListConstructOp>(
+        loc, rewriter.getType<ListType>(listElemType),
+        ArrayRef<Value>{unsqueezedRoiBatchIndex, channelRange, y, x});
+    auto indexElementType = xLowType.getWithSizesAndDtype(
+        ArrayRef{Torch::kUnknownSize, Torch::kUnknownSize, Torch::kUnknownSize,
+                 Torch::kUnknownSize, Torch::kUnknownSize, Torch::kUnknownSize},
+        /*optionalDtype=*/inputVType.getDtype());
+    Value indexTensor = rewriter.create<AtenIndexTensorOp>(
+        loc, indexElementType, input, indexList);
+    // Mark unknown dims for now
+    return indexTensor;
+  };
+
+  auto outerProd = [&](Value y, Value x) -> FailureOr<Value> {
+    SmallVector<Value> yDims, xDims;
+    getTorchConstantInts({1, 3, 5}, yDims);
+    getTorchConstantInts({1, 2, 4}, xDims);
+    if (failed(unqueezeTensorDims(op, rewriter, y, y, yDims)))
+      return failure();
+    if (failed(unqueezeTensorDims(op, rewriter, x, x, xDims)))
+      return failure();
+    auto indexElementType = xLowType.getWithSizesAndDtype(
+        ArrayRef{Torch::kUnknownSize, Torch::kUnknownSize, Torch::kUnknownSize,
+                 Torch::kUnknownSize, Torch::kUnknownSize, Torch::kUnknownSize},
+        /*optionalDtype=*/inputVType.getDtype());
+    Value mulXY = rewriter.create<AtenMulTensorOp>(loc, indexElementType, y, x);
+    return mulXY;
+  };
+
+  auto mask = getMaskedIndex(yLow, xLow);
+  if (failed(mask))
+    return failure();
+  Value v1 = mask.value();
+
+  mask = getMaskedIndex(yLow, xHigh);
+  if (failed(mask))
+    return failure();
+  Value v2 = mask.value();
+
+  mask = getMaskedIndex(yHigh, xLow);
+  if (failed(mask))
+    return failure();
+  Value v3 = mask.value();
+
+  mask = getMaskedIndex(yHigh, xHigh);
+  if (failed(mask))
+    return failure();
+  Value v4 = mask.value();
+
+  auto prod = outerProd(hy, hx);
+  if (failed(prod))
+    return failure();
+  Value w1 = prod.value();
+
+  prod = outerProd(hy, lx);
+  if (failed(prod))
+    return failure();
+  Value w2 = prod.value();
+
+  prod = outerProd(ly, hx);
+  if (failed(prod))
+    return failure();
+  Value w3 = prod.value();
+
+  prod = outerProd(ly, lx);
+  if (failed(prod))
+    return failure();
+  Value w4 = prod.value();
+
+  auto v1w1 = rewriter.create<AtenMulTensorOp>(loc, w1.getType(), w1, v1);
+  auto v2w2 = rewriter.create<AtenMulTensorOp>(loc, w1.getType(), w2, v2);
+  auto v3w3 = rewriter.create<AtenMulTensorOp>(loc, w1.getType(), w3, v3);
+  auto v4w4 = rewriter.create<AtenMulTensorOp>(loc, w1.getType(), w4, v4);
+
+  auto res1 =
+      rewriter.create<AtenAddTensorOp>(loc, w1.getType(), v1w1, v2w2, cstOne);
+  auto res2 =
+      rewriter.create<AtenAddTensorOp>(loc, w1.getType(), v3w3, v4w4, cstOne);
+
+  Value result =
+      rewriter.create<AtenAddTensorOp>(loc, w1.getType(), res1, res2, cstOne);
+
+  return result;
+}
+
 namespace {
 class DecomposeTorchVisionRoiAlignOp
     : public OpRewritePattern<TorchvisionRoiAlignOp> {
@@ -11577,6 +11768,8 @@ public:
     auto samplingRatio = op.getSamplingRatio();
 
     Value cstNone = rewriter.create<ConstantNoneOp>(loc);
+    Value cstFalse = rewriter.create<Torch::ConstantBoolOp>(loc, false);
+
     Value cstZero =
         rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(0));
     Value cstOne =
@@ -11589,30 +11782,30 @@ public:
         rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(4));
     Value cstMinusOne =
         rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(-1));
+    Value cstMinusTwo =
+        rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(-2));
 
-    Value cstZeroF =
-        rewriter.create<ConstantFloatOp>(loc, rewriter.getF64FloatAttr(0.0));
     Value cstHalf =
         rewriter.create<ConstantFloatOp>(loc, rewriter.getF64FloatAttr(0.5));
     Value cstOneF =
         rewriter.create<ConstantFloatOp>(loc, rewriter.getF64FloatAttr(1.0));
 
     auto si64Type = rewriter.getIntegerType(/*width=*/64, /*isSigned*/ true);
-    auto i64DType = getDtypeIntValueForType(rewriter, loc, si64Type);
+    // auto i64DType = getDtypeIntValueForType(rewriter, loc, si64Type);
     ValueTensorType inputVType = cast<ValueTensorType>(input.getType());
 
     auto pooledHeightRangeType =
         getTensorTypeFromShapeValues({pooledHeight}, si64Type);
     Value pooledHeightRange = rewriter.create<AtenArangeOp>(
         loc, pooledHeightRangeType, pooledHeight,
-        /*dtype=*/i64DType, /*layout=*/cstNone,
+        /*dtype=*/cstNone, /*layout=*/cstNone,
         /*device=*/cstNone, /*pin_memory=*/cstNone);
 
     auto pooledWidthRangeType =
         getTensorTypeFromShapeValues({pooledWidth}, si64Type);
     Value pooledWidthRange = rewriter.create<AtenArangeOp>(
         loc, pooledWidthRangeType, pooledWidth,
-        /*dtype=*/i64DType, /*layout=*/cstNone,
+        /*dtype=*/cstNone, /*layout=*/cstNone,
         /*device=*/cstNone, /*pin_memory=*/cstNone);
 
     auto roiDimSize = getTensorDimSize(rewriter, rois, 0);
@@ -11628,6 +11821,9 @@ public:
     // First index of roi corresponds to batch -> rois[:, 0]
     Value roiBatchIndex = rewriter.create<AtenSelectIntOp>(
         loc, roiDimTensorType, rois, cstOne, cstZero);
+    roiBatchIndex = convertTensorToDtype(rewriter, loc, roiBatchIndex,
+                                         rewriter.getIntegerType(32, true));
+
     Value roiStartWIndex = rewriter.create<AtenSelectIntOp>(
         loc, roiDimTensorType, rois, cstOne, cstOne);
     roiStartWIndex = rewriter.create<AtenMulScalarOp>(
@@ -11692,11 +11888,11 @@ public:
 
     Value roiBinGridWidthRange = rewriter.create<AtenArangeOp>(
         loc, binGridTensorType, samplingRatio /*roiBinGridWidth*/,
-        /*dtype=*/i64DType, /*layout=*/cstNone,
+        /*dtype=*/cstNone, /*layout=*/cstNone,
         /*device=*/cstNone, /*pin_memory=*/cstNone); // ix
     Value roiBinGridHeightRange = rewriter.create<AtenArangeOp>(
         loc, binGridTensorType, samplingRatio /*roiBinGridHeight*/,
-        /*dtype=*/i64DType, /*layout=*/cstNone,
+        /*dtype=*/cstNone, /*layout=*/cstNone,
         /*device=*/cstNone, /*pin_memory=*/cstNone); // iy
 
     if (failed(unqueezeTensorDims(op, rewriter, roiStartHIndex, roiStartHIndex,
@@ -11767,7 +11963,7 @@ public:
 
     broadcasts = broadcastOperands(addRoipHbH, mulBinSizeGridH);
 
-    Value x = rewriter.create<AtenAddTensorOp>(loc, broadcasts.first.getType(),
+    Value y = rewriter.create<AtenAddTensorOp>(loc, broadcasts.first.getType(),
                                                broadcasts.first,
                                                broadcasts.second, cstOne);
 
@@ -11817,14 +12013,33 @@ public:
 
     broadcasts = broadcastOperands(addRoipWbW, mulBinSizeGridW);
 
-    Value y = rewriter.create<AtenAddTensorOp>(loc, broadcasts.first.getType(),
+    Value x = rewriter.create<AtenAddTensorOp>(loc, broadcasts.first.getType(),
                                                broadcasts.first,
                                                broadcasts.second, cstOne);
 
-    llvm::errs() << "\n decomposed roi align"
-                 << op->getParentOfType<func::FuncOp>();
+    auto interpolate = bilinearInterpolateForRoiAlign(
+        rewriter, op, input, roiBatchIndex, y, x, {}, {});
 
-    return failure();
+    if (failed(interpolate))
+      return failure();
+
+    Value v = interpolate.value();
+
+    auto sizeListType =
+        rewriter.getType<Torch::ListType>(rewriter.getType<Torch::IntType>());
+    Value reduceDimList = rewriter.create<PrimListConstructOp>(
+        loc, sizeListType, ArrayRef<Value>{cstMinusOne, cstMinusTwo});
+    Value reducedRoiAlign = rewriter.create<AtenSumDimIntListOp>(
+        loc, op->getResultTypes()[0], v, reduceDimList, cstFalse,
+        /*dtype=*/cstNone);
+    auto countValue =
+        rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(count));
+    auto roiAlign = rewriter.create<AtenDivScalarOp>(
+        loc, reducedRoiAlign.getType(), reducedRoiAlign, countValue);
+    // llvm::errs() << "\n decomposed roi align"
+    //              << op->getParentOfType<func::FuncOp>();
+    rewriter.replaceOp(op, roiAlign);
+    return success();
   }
 };
 } // namespace
@@ -12141,7 +12356,7 @@ public:
 
     GreedyRewriteConfig config;
     config.useTopDownTraversal = true;
-    config.maxIterations = 2; // GreedyRewriteConfig::kNoLimit;
+    config.maxIterations = GreedyRewriteConfig::kNoLimit;
 
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
                                      config))) {
