@@ -11,6 +11,7 @@
 
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchDialect.h"
@@ -21,8 +22,11 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/LogicalResult.h"
 #include <cstdint>
 #include <set>
+#include <utility>
 
 using namespace mlir;
 using namespace mlir::torch;
@@ -11542,6 +11546,289 @@ public:
 };
 } // namespace
 
+static LogicalResult unqueezeTensorDims(Operation *op,
+                                        PatternRewriter &rewriter, Value input,
+                                        Value &unsqueezedResult,
+                                        ArrayRef<Value> dims) {
+  unsqueezedResult = input;
+  for (auto dim : dims) {
+    auto unsqueezed = unsqueezeTensor(rewriter, op, unsqueezedResult, dim);
+    if (failed(unsqueezed))
+      return rewriter.notifyMatchFailure(op, "Failed to unsqueeze tensor");
+    unsqueezedResult = unsqueezed.value();
+  }
+  return success();
+}
+
+namespace {
+class DecomposeTorchVisionRoiAlignOp
+    : public OpRewritePattern<TorchvisionRoiAlignOp> {
+public:
+  using OpRewritePattern<TorchvisionRoiAlignOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(TorchvisionRoiAlignOp op,
+                                PatternRewriter &rewriter) const override {
+
+    auto loc = op.getLoc();
+    auto input = op.getInput();
+    auto pooledHeight = op.getPooledHeight();
+    auto pooledWidth = op.getPooledWidth();
+    auto rois = op.getRois();
+    auto spatialScale = op.getSpatialScale();
+    auto samplingRatio = op.getSamplingRatio();
+
+    Value cstNone = rewriter.create<ConstantNoneOp>(loc);
+    Value cstZero =
+        rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(0));
+    Value cstOne =
+        rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(1));
+    Value cstTwo =
+        rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(2));
+    Value cstThree =
+        rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(3));
+    Value cstFour =
+        rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(4));
+    Value cstMinusOne =
+        rewriter.create<ConstantIntOp>(loc, rewriter.getI64IntegerAttr(-1));
+
+    Value cstZeroF =
+        rewriter.create<ConstantFloatOp>(loc, rewriter.getF64FloatAttr(0.0));
+    Value cstHalf =
+        rewriter.create<ConstantFloatOp>(loc, rewriter.getF64FloatAttr(0.5));
+    Value cstOneF =
+        rewriter.create<ConstantFloatOp>(loc, rewriter.getF64FloatAttr(1.0));
+
+    auto si64Type = rewriter.getIntegerType(/*width=*/64, /*isSigned*/ true);
+    auto i64DType = getDtypeIntValueForType(rewriter, loc, si64Type);
+    ValueTensorType inputVType = cast<ValueTensorType>(input.getType());
+
+    auto pooledHeightRangeType =
+        getTensorTypeFromShapeValues({pooledHeight}, si64Type);
+    Value pooledHeightRange = rewriter.create<AtenArangeOp>(
+        loc, pooledHeightRangeType, pooledHeight,
+        /*dtype=*/i64DType, /*layout=*/cstNone,
+        /*device=*/cstNone, /*pin_memory=*/cstNone);
+
+    auto pooledWidthRangeType =
+        getTensorTypeFromShapeValues({pooledWidth}, si64Type);
+    Value pooledWidthRange = rewriter.create<AtenArangeOp>(
+        loc, pooledWidthRangeType, pooledWidth,
+        /*dtype=*/i64DType, /*layout=*/cstNone,
+        /*device=*/cstNone, /*pin_memory=*/cstNone);
+
+    auto roiDimSize = getTensorDimSize(rewriter, rois, 0);
+    auto roiTensorType = cast<ValueTensorType>(rois.getType());
+    auto roiDimTensorType =
+        getTensorTypeFromShapeValues({roiDimSize}, roiTensorType.getDtype());
+
+    bool isAligned;
+    if (!matchPattern(op.getAligned(), m_TorchConstantBool(&isAligned)))
+      return rewriter.notifyMatchFailure(
+          op, "Expected a boolean value for RoiAligned's aligned operend");
+
+    // First index of roi corresponds to batch -> rois[:, 0]
+    Value roiBatchIndex = rewriter.create<AtenSelectIntOp>(
+        loc, roiDimTensorType, rois, cstOne, cstZero);
+    Value roiStartWIndex = rewriter.create<AtenSelectIntOp>(
+        loc, roiDimTensorType, rois, cstOne, cstOne);
+    roiStartWIndex = rewriter.create<AtenMulScalarOp>(
+        loc, roiDimTensorType, roiStartWIndex, spatialScale);
+    Value roiStartHIndex = rewriter.create<AtenSelectIntOp>(
+        loc, roiDimTensorType, rois, cstOne, cstTwo);
+    roiStartHIndex = rewriter.create<AtenMulScalarOp>(
+        loc, roiDimTensorType, roiStartHIndex, spatialScale);
+    Value roiEndWIndex = rewriter.create<AtenSelectIntOp>(
+        loc, roiDimTensorType, rois, cstOne, cstThree);
+    roiEndWIndex = rewriter.create<AtenMulScalarOp>(loc, roiDimTensorType,
+                                                    roiEndWIndex, spatialScale);
+    Value roiEndHIndex = rewriter.create<AtenSelectIntOp>(
+        loc, roiDimTensorType, rois, cstOne, cstFour);
+    roiEndHIndex = rewriter.create<AtenMulScalarOp>(loc, roiDimTensorType,
+                                                    roiEndHIndex, spatialScale);
+
+    if (isAligned) {
+      Value offset = cstHalf;
+      roiStartWIndex = rewriter.create<AtenSubScalarOp>(
+          loc, roiDimTensorType, roiStartWIndex, offset, cstOne);
+      roiStartHIndex = rewriter.create<AtenSubScalarOp>(
+          loc, roiDimTensorType, roiStartHIndex, offset, cstOne);
+      roiEndWIndex = rewriter.create<AtenSubScalarOp>(
+          loc, roiDimTensorType, roiEndWIndex, offset, cstOne);
+      roiEndHIndex = rewriter.create<AtenSubScalarOp>(
+          loc, roiDimTensorType, roiEndHIndex, offset, cstOne);
+    }
+
+    Value roiWidth = rewriter.create<AtenSubTensorOp>(
+        loc, roiDimTensorType, roiEndWIndex, roiStartWIndex, cstOne);
+    Value roiHeight = rewriter.create<AtenSubTensorOp>(
+        loc, roiDimTensorType, roiEndHIndex, roiStartHIndex, cstOne);
+
+    if (!isAligned) {
+      roiWidth = rewriter.create<AtenClampMinOp>(loc, roiDimTensorType,
+                                                 roiWidth, cstOneF);
+      roiHeight = rewriter.create<AtenClampMinOp>(loc, roiDimTensorType,
+                                                  roiHeight, cstOneF);
+    }
+
+    Value binSizeHeight = rewriter.create<AtenDivScalarOp>(
+        loc, roiDimTensorType, roiHeight, pooledHeight);
+    Value binSizeWidth = rewriter.create<AtenDivScalarOp>(
+        loc, roiDimTensorType, roiWidth, pooledWidth);
+
+    int64_t samplingRatioInt;
+    if (!matchPattern(samplingRatio, m_TorchConstantInt(&samplingRatioInt)))
+      return rewriter.notifyMatchFailure(
+          op, "Expected RoiAligned's sampling ratio to be a constant integer");
+
+    if (samplingRatioInt <= 0) {
+      llvm_unreachable("Handle sampling ratio <= 0");
+    }
+
+    int64_t roiBinGridWidth = samplingRatioInt;
+    int64_t roiBinGridHeight = samplingRatioInt;
+    int64_t count = std::max(roiBinGridWidth * roiBinGridHeight, (long)1);
+
+    auto binGridTensorType =
+        getTensorTypeFromShapeValues({samplingRatio}, si64Type);
+
+    Value roiBinGridWidthRange = rewriter.create<AtenArangeOp>(
+        loc, binGridTensorType, samplingRatio /*roiBinGridWidth*/,
+        /*dtype=*/i64DType, /*layout=*/cstNone,
+        /*device=*/cstNone, /*pin_memory=*/cstNone); // ix
+    Value roiBinGridHeightRange = rewriter.create<AtenArangeOp>(
+        loc, binGridTensorType, samplingRatio /*roiBinGridHeight*/,
+        /*dtype=*/i64DType, /*layout=*/cstNone,
+        /*device=*/cstNone, /*pin_memory=*/cstNone); // iy
+
+    if (failed(unqueezeTensorDims(op, rewriter, roiStartHIndex, roiStartHIndex,
+                                  {cstOne, cstTwo})))
+      return failure();
+
+    if (failed(unqueezeTensorDims(op, rewriter, binSizeHeight, binSizeHeight,
+                                  {cstOne, cstTwo})))
+      return failure();
+
+    if (failed(unqueezeTensorDims(op, rewriter, pooledHeightRange,
+                                  pooledHeightRange, {cstZero, cstTwo})))
+      return failure();
+
+    if (failed(unqueezeTensorDims(op, rewriter, roiBinGridHeightRange,
+                                  roiBinGridHeightRange, {cstZero, cstOne})))
+      return failure();
+
+    auto broadcastOperands = [&](Value v1, Value v2) {
+      if (v1.getType() == v2.getType())
+        return std::make_pair(v1, v2);
+
+      SmallVector<int64_t> broadcastShape;
+      SmallVector<Value> broadcastShapeValue;
+
+      Type dType = cast<ValueTensorType>(v1.getType()).getDtype();
+      computeBroadcastShape(rewriter, loc, v1, v2, broadcastShape,
+                            broadcastShapeValue);
+      Type broadcastType = ValueTensorType::get(
+          op.getContext(), llvm::ArrayRef(broadcastShape), dType);
+      Value indexBroadcastShapeTorchList = rewriter.create<PrimListConstructOp>(
+          loc, Torch::ListType::get(Torch::IntType::get(op.getContext())),
+          broadcastShapeValue);
+      v1 = rewriter.create<AtenBroadcastToOp>(loc, broadcastType, v1,
+                                              indexBroadcastShapeTorchList);
+      v2 = rewriter.create<AtenBroadcastToOp>(loc, broadcastType, v2,
+                                              indexBroadcastShapeTorchList);
+      return std::make_pair(v1, v2);
+    };
+
+    std::pair<Value, Value> broadcasts;
+
+    pooledHeightRange = convertTensorToDtype(rewriter, loc, pooledHeightRange,
+                                             inputVType.getDtype());
+    broadcasts = broadcastOperands(pooledHeightRange, binSizeHeight);
+    Value mulpHbH = rewriter.create<AtenMulTensorOp>(
+        loc, broadcasts.first.getType(), broadcasts.first, broadcasts.second);
+
+    broadcasts = broadcastOperands(roiStartHIndex, mulpHbH);
+    Value addRoipHbH = rewriter.create<AtenAddTensorOp>(
+        loc, broadcasts.first.getType(), broadcasts.first, broadcasts.second,
+        cstOne);
+
+    roiBinGridHeightRange = convertTensorToDtype(
+        rewriter, loc, roiBinGridHeightRange, inputVType.getDtype());
+
+    Value addBinGridRangeH = rewriter.create<AtenAddScalarOp>(
+        loc, roiBinGridHeightRange.getType(), roiBinGridHeightRange, cstHalf,
+        cstOne);
+
+    Value divBinSizeHGridH = rewriter.create<AtenDivScalarOp>(
+        loc, binSizeHeight.getType(), binSizeHeight,
+        samplingRatio /*roiBinGridHeight*/);
+
+    broadcasts = broadcastOperands(addBinGridRangeH, divBinSizeHGridH);
+    Value mulBinSizeGridH = rewriter.create<AtenMulTensorOp>(
+        loc, broadcasts.first.getType(), broadcasts.first, broadcasts.second);
+
+    broadcasts = broadcastOperands(addRoipHbH, mulBinSizeGridH);
+
+    Value x = rewriter.create<AtenAddTensorOp>(loc, broadcasts.first.getType(),
+                                               broadcasts.first,
+                                               broadcasts.second, cstOne);
+
+    if (failed(unqueezeTensorDims(op, rewriter, roiStartWIndex, roiStartWIndex,
+                                  {cstOne, cstTwo})))
+      return failure();
+
+    if (failed(unqueezeTensorDims(op, rewriter, binSizeWidth, binSizeWidth,
+                                  {cstOne, cstTwo})))
+      return failure();
+
+    if (failed(unqueezeTensorDims(op, rewriter, pooledWidthRange,
+                                  pooledWidthRange, {cstZero, cstTwo})))
+      return failure();
+
+    if (failed(unqueezeTensorDims(op, rewriter, roiBinGridWidthRange,
+                                  roiBinGridWidthRange, {cstZero, cstOne})))
+      return failure();
+
+    pooledWidthRange = convertTensorToDtype(rewriter, loc, pooledWidthRange,
+                                            inputVType.getDtype());
+    broadcasts = broadcastOperands(pooledWidthRange, binSizeWidth);
+    Value mulpWbW = rewriter.create<AtenMulTensorOp>(
+        loc, broadcasts.first.getType(), broadcasts.first, broadcasts.second);
+
+    broadcasts = broadcastOperands(roiStartWIndex, mulpWbW);
+    Value addRoipWbW = rewriter.create<AtenAddTensorOp>(
+        loc, broadcasts.first.getType(), broadcasts.first, broadcasts.second,
+        cstOne);
+
+    auto binGridRangeWType =
+        cast<ValueTensorType>(roiBinGridWidthRange.getType());
+
+    binGridRangeWType = ValueTensorType::get(
+        op.getContext(), llvm::ArrayRef(binGridRangeWType.getSizes()),
+        inputVType.getDtype());
+    Value addBinGridRangeW = rewriter.create<AtenAddScalarOp>(
+        loc, binGridRangeWType, roiBinGridWidthRange, cstHalf, cstOne);
+
+    Value divBinSizeWGridW = rewriter.create<AtenDivScalarOp>(
+        loc, binSizeWidth.getType(), binSizeWidth,
+        samplingRatio /*roiBinGridWidth*/);
+
+    broadcasts = broadcastOperands(addBinGridRangeW, divBinSizeWGridW);
+    Value mulBinSizeGridW = rewriter.create<AtenMulTensorOp>(
+        loc, broadcasts.first.getType(), broadcasts.first, broadcasts.second);
+
+    broadcasts = broadcastOperands(addRoipWbW, mulBinSizeGridW);
+
+    Value y = rewriter.create<AtenAddTensorOp>(loc, broadcasts.first.getType(),
+                                               broadcasts.first,
+                                               broadcasts.second, cstOne);
+
+    llvm::errs() << "\n decomposed roi align"
+                 << op->getParentOfType<func::FuncOp>();
+
+    return failure();
+  }
+};
+} // namespace
+
 namespace {
 class DecomposeComplexOpsPass
     : public DecomposeComplexOpsBase<DecomposeComplexOpsPass> {
@@ -11846,6 +12133,7 @@ public:
 
     // Torchvision ops
     addPatternIfTargetOpIsIllegal<DecomposeTorchvisionNmsOp>(patterns);
+    addPatternIfTargetOpIsIllegal<DecomposeTorchVisionRoiAlignOp>(patterns);
 
     addPatternIfTargetOpIsIllegal<DecomposeAtenConstrainRangeForSizeOp>(
         patterns);
@@ -11853,7 +12141,7 @@ public:
 
     GreedyRewriteConfig config;
     config.useTopDownTraversal = true;
-    config.maxIterations = GreedyRewriteConfig::kNoLimit;
+    config.maxIterations = 2; // GreedyRewriteConfig::kNoLimit;
 
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns),
                                      config))) {
